@@ -5,6 +5,55 @@ Centralizes image splitting and other image-related functionality.
 import os
 from PIL import Image
 from config import CHUNK_SIZE
+import numpy as np
+from sklearn.cluster import KMeans
+
+def extract_common_colors(image_path, num_colors=5):
+    """
+    Extracts the most common colors from an image.
+    If the image has fewer unique colors than requested, all unique colors are returned.
+    Otherwise, k-means clustering is used to find the dominant colors.
+    
+    Args:
+        image_path (str): Path to the source image.
+        num_colors (int): Number of common colors to extract.
+        
+    Returns:
+        list: A list of the most common colors as RGB tuples, sorted by frequency.
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+        
+    # Load image and convert to RGB
+    image = Image.open(image_path).convert('RGB')
+    
+    # Resize for performance, preserving aspect ratio
+    image.thumbnail((100, 100))
+    
+    # Get pixel data as a NumPy array
+    pixels = np.array(image)
+    pixels = pixels.reshape(-1, 3)
+    
+    # If the image has few colors, no need for clustering
+    unique_colors = np.unique(pixels, axis=0)
+    if len(unique_colors) <= num_colors:
+        return [tuple(color) for color in unique_colors]
+
+    # For images with many colors, use k-means to find dominant colors
+    kmeans = KMeans(n_clusters=num_colors, random_state=0, n_init=10)
+    kmeans.fit(pixels)
+    
+    # Get the RGB values of the cluster centers
+    colors = kmeans.cluster_centers_.astype(int)
+    
+    # Sort colors by frequency to present the most common ones first
+    labels = kmeans.labels_
+    counts = np.bincount(labels, minlength=num_colors)
+    sorted_indices = np.argsort(-counts)
+    
+    sorted_colors = colors[sorted_indices]
+    
+    return [tuple(color) for color in sorted_colors]
 
 def split_image_into_chunks(image_path, output_folder):
     """

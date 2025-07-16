@@ -1,7 +1,7 @@
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import BOTH, LEFT, RIGHT, NORMAL, DISABLED, HORIZONTAL, W, X, BOTTOM, Y
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import os
 import threading
@@ -15,7 +15,8 @@ from config import (
 from image_window import ImageWindow
 from win_utils import poll_global_keys
 from calibration_window import CalibrationWindow
-from image_utils import split_image_into_chunks, count_existing_chunks
+from image_utils import split_image_into_chunks, count_existing_chunks, extract_common_colors
+from color_assistant_window import ColorAssistantWindow
 
 class ControlWindow(ttk.Window):
     """
@@ -96,6 +97,9 @@ class ControlWindow(ttk.Window):
         self.load_button = ttk.Button(mode_frame, text="Load Image", command=self.load_image_from_dialog, state=NORMAL)
         self.load_button.pack(side=LEFT, padx=5)
 
+        self.color_assistant_button = ttk.Button(mode_frame, text="Color Assistant", command=self.open_color_assistant, state=DISABLED)
+        self.color_assistant_button.pack(side=LEFT, padx=5)
+
         self.clickthrough_var = tk.BooleanVar()
         self.clickthrough_toggle = ttk.Checkbutton(mode_frame, text="Click-Through", variable=self.clickthrough_var, command=self.on_toggle_clickthrough)
         self.clickthrough_toggle.pack(side=RIGHT, expand=True)
@@ -174,6 +178,25 @@ class ControlWindow(ttk.Window):
             self.clickthrough_var.set(False) # Ensure var is in a predictable state
             return
         self.image_window.toggle_clickthrough(self.clickthrough_var.get())
+
+    def open_color_assistant(self):
+        """
+        Opens the color assistant window to select a highlight color.
+        """
+        if not self.original_image_path:
+            return
+
+        try:
+            colors = extract_common_colors(self.original_image_path, num_colors=5)
+            
+            assistant = ColorAssistantWindow(self, colors)
+            self.wait_window(assistant)
+            
+            if assistant.selected_color and self.image_window:
+                self.image_window.highlight_color(assistant.selected_color)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not extract colors: {e}")
 
     def calibrate_single_chunk(self):
         """
@@ -255,6 +278,16 @@ class ControlWindow(ttk.Window):
             self.original_image_path, self.chunk_folder
         )
 
+        # --- Update GUI ---
+        self.title(f"Dither-it Control - {os.path.basename(self.original_image_path)}")
+        self.chunk_slider.config(to=self.total_chunks - 1, state=NORMAL)
+        self.opacity_slider.config(state=NORMAL)
+        self.scale_slider.config(state=NORMAL)
+        self.chunk_label.config(text=f"Chunk: 1/{self.total_chunks}")
+        self.calibrate_button.config(state=DISABLED)
+        self.color_assistant_button.config(state=NORMAL)
+
+        # --- Create ImageWindow ---
         if self.image_window:
             self.image_window.destroy()
         self.image_window = ImageWindow(self, self.original_pil_image, self.num_chunks_x, self.num_chunks_y)
