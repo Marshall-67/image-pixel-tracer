@@ -5,9 +5,10 @@ import win32gui
 from config import (
     CHUNK_SIZE, DEFAULT_ALPHA, DEFAULT_SCALE, CALIBRATED_SCALE,
     GRID_COLOR_FULL, GRID_COLOR_PIXEL, HIGHLIGHT_COLOR, TRANSPARENT_COLOR,
-    DEFAULT_WINDOW_X, DEFAULT_WINDOW_Y, MIN_SCALE, MAX_SCALE
+    DEFAULT_WINDOW_X, DEFAULT_WINDOW_Y, MIN_SCALE, MAX_SCALE, MIN_ALPHA, MAX_ALPHA
 )
 from win_utils import set_clickthrough
+from image_utils import colors_are_similar
 
 class ImageWindow(tk.Toplevel):
     """
@@ -38,8 +39,9 @@ class ImageWindow(tk.Toplevel):
         self.target_h = None
 
         # Highlighting
-        self.highlighted_color = None
+        self.highlighted_colors = []
         self.highlight_rects = []
+        self.highlight_tolerance = 0
 
         # Image dimensions
         self.original_width, self.original_height = self.original_pil_image.size
@@ -142,7 +144,7 @@ class ImageWindow(tk.Toplevel):
             self.draw_full_image_with_grid()
         
         self.draw_highlight()
-        if self.highlighted_color:
+        if self.highlighted_colors:
             self.draw_color_highlights()
 
     def draw_single_chunk(self):
@@ -181,8 +183,8 @@ class ImageWindow(tk.Toplevel):
         self.draw_pixel_grid(0, 0, chunk_w, chunk_h, pixel_size)
 
     def draw_color_highlights(self):
-        """Highlights pixels of a specific color."""
-        if not self.single_chunk_mode or not self.highlighted_color:
+        """Highlights pixels of specific colors."""
+        if not self.single_chunk_mode or not self.highlighted_colors:
             return
 
         chunk_w, chunk_h = self.get_current_chunk_size()
@@ -201,23 +203,28 @@ class ImageWindow(tk.Toplevel):
         
         pixel_size = self.img_width / chunk_w
         
-        r_target, g_target, b_target = self.highlighted_color
+        # The primary color for filling is the first one in the list
+        r_fill, g_fill, b_fill = self.highlighted_colors[0]
         
         for y_local in range(chunk_h):
             for x_local in range(chunk_w):
                 r, g, b = pixel_data[x_local, y_local]
-                if (r, g, b) == (r_target, g_target, b_target):
-                    rx1 = x_local * pixel_size
-                    ry1 = y_local * pixel_size
-                    rx2 = rx1 + pixel_size
-                    ry2 = ry1 + pixel_size
-                    rect = self.canvas.create_rectangle(
-                        rx1, ry1, rx2, ry2, 
-                        fill=f"#{r_target:02x}{g_target:02x}{b_target:02x}", 
-                        outline="red", 
-                        width=1
-                    )
-                    self.highlight_rects.append(rect)
+                
+                # Check if the pixel matches any of the selected colors
+                for target_color in self.highlighted_colors:
+                    if colors_are_similar((r, g, b), target_color, self.highlight_tolerance):
+                        rx1 = x_local * pixel_size
+                        ry1 = y_local * pixel_size
+                        rx2 = rx1 + pixel_size
+                        ry2 = ry1 + pixel_size
+                        rect = self.canvas.create_rectangle(
+                            rx1, ry1, rx2, ry2, 
+                            fill=f"#{r_fill:02x}{g_fill:02x}{b_fill:02x}", 
+                            outline="red", 
+                            width=1
+                        )
+                        self.highlight_rects.append(rect)
+                        break # Found a match, no need to check other colors
 
     def draw_pixel_grid(self, img_x, img_y, chunk_w, chunk_h, pixel_size):
         """Draws a pixel grid on the enlarged chunk."""
@@ -250,40 +257,105 @@ class ImageWindow(tk.Toplevel):
             self.canvas.create_line(0, y, self.img_width, y, fill=GRID_COLOR_FULL, dash=(2, 4))
 
     def draw_highlight(self):
-        """Draws the highlight box for the active chunk."""
-        self.canvas.delete("highlight")
-        if not self.single_chunk_mode:
-            row = self.current_chunk_index // self.num_chunks_x
-            col = self.current_chunk_index % self.num_chunks_x
-            
-            scaled_chunk_size = CHUNK_SIZE * self.scale_factor
-            x1 = col * scaled_chunk_size
-            y1 = row * scaled_chunk_size
-            x2 = x1 + scaled_chunk_size
-            y2 = y1 + scaled_chunk_size
-            
-            self.canvas.create_rectangle(
-                x1, y1, x2, y2,
-                outline=HIGHLIGHT_COLOR,
-                width=2,
-                tags="highlight"
-            )
+        """Draws the highlight rectangle over the current chunk."""
+        if self.single_chunk_mode:
+            return # No highlight needed when only one chunk is visible
 
-    # --- Public methods for ControlWindow to call ---
-    def highlight_color(self, color):
-        """Sets the color to be highlighted."""
-        self.highlighted_color = color
-        self.update_display()
+        scaled_chunk_w = CHUNK_SIZE * self.scale_factor
+        scaled_chunk_h = CHUNK_SIZE * self.scale_factor
         
+        row = self.current_chunk_index // self.num_chunks_x
+        col = self.current_chunk_index % self.num_chunks_x
+        
+        x1 = col * scaled_chunk_w
+        y1 = row * scaled_chunk_h
+        x2 = x1 + scaled_chunk_w
+        y2 = y1 + scaled_chunk_h
+        
+        self.canvas.create_rectangle(x1, y1, x2, y2, outline=HIGHLIGHT_COLOR, width=2)
+        
+    # --- Public methods for ControlWindow to call ---
+    def highlight_colors(self, colors, tolerance=0):
+        """Sets the colors to be highlighted."""
+        self.highlighted_colors = colors
+        self.highlight_tolerance = tolerance
+        self.update_display()
+
     def clear_color_highlight(self):
-        """Clears any active color highlighting."""
-        self.highlighted_color = None
+        """Clears any color highlighting."""
         for rect in self.highlight_rects:
             self.canvas.delete(rect)
         self.highlight_rects.clear()
+        self.highlighted_colors = []
+        self.update_display()
+
+    def get_pixel_locations_for_colors(self, target_colors):
+        """
+        Gets the absolute screen coordinates for all pixels in the current chunk
+        that match any of the target colors.
+        """
+        if not self.single_chunk_mode or not target_colors:
+            return []
+
+        # Ensure the window is placed correctly before getting locations
+        self.update_display()
+        self.update_idletasks()
+        
+        win_x = self.winfo_x()
+        win_y = self.winfo_y()
+
+        chunk_w, chunk_h = self.get_current_chunk_size()
+        if chunk_w == 0 or chunk_h == 0:
+            return []
+
+        row = self.current_chunk_index // self.num_chunks_x
+        col = self.current_chunk_index % self.num_chunks_x
+        x1 = col * CHUNK_SIZE
+        y1 = row * CHUNK_SIZE
+        x2 = min(x1 + CHUNK_SIZE, self.original_width)
+        y2 = min(y1 + CHUNK_SIZE, self.original_height)
+        
+        try:
+            chunk_image = self.original_pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+            pixel_data = chunk_image.load()
+        except Exception as e:
+            print(f"Error getting chunk image data: {e}")
+            return []
+
+        locations = []
+        pixel_w = self.img_width / chunk_w
+        pixel_h = self.img_height / chunk_h
+
+        for y_local in range(chunk_h):
+            for x_local in range(chunk_w):
+                r, g, b = pixel_data[x_local, y_local]
+                
+                for target_color in target_colors:
+                    if colors_are_similar((r, g, b), target_color, self.highlight_tolerance):
+                        # Calculate center of the scaled pixel on the canvas
+                        canvas_x = x_local * pixel_w + (pixel_w / 2)
+                        canvas_y = y_local * pixel_h + (pixel_h / 2)
+                        
+                        # Convert to absolute screen coordinates
+                        screen_x = win_x + canvas_x
+                        screen_y = win_y + canvas_y
+                        
+                        locations.append((int(screen_x), int(screen_y)))
+                        break # Found a match, move to the next pixel
+
+        return locations
 
     def set_alpha(self, value):
-        self.alpha = value
+        """Sets the window's alpha/opacity."""
+        self.alpha = max(MIN_ALPHA, min(MAX_ALPHA, float(value)))
+        if hasattr(self, 'hwnd'):
+            set_clickthrough(self.hwnd, self.alpha, self.clickthrough_mode)
+        else:
+            # If hwnd isn't initialized yet, schedule the alpha update for after initialization
+            self.after(150, lambda: self._apply_alpha_if_ready())
+
+    def _apply_alpha_if_ready(self):
+        """Applies the current alpha value if the window handle is ready."""
         if hasattr(self, 'hwnd'):
             set_clickthrough(self.hwnd, self.alpha, self.clickthrough_mode)
 

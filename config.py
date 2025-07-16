@@ -32,6 +32,7 @@ DEFAULT_HOTKEYS = {
     'reset_scale': 'R',
     'toggle_single_chunk': 'S',
     'toggle_clickthrough': 'C',
+    'stop_drawing': 'F12',
 }
 
 # Method mapping for hotkey actions
@@ -46,6 +47,7 @@ HOTKEY_METHOD_MAP = {
     'reset_scale': 'reset_scale',
     'toggle_single_chunk': 'toggle_single_chunk_mode',
     'toggle_clickthrough': 'toggle_clickthrough_mode',
+    'stop_drawing': 'stop_automated_drawing',
 }
 
 # Calibration settings

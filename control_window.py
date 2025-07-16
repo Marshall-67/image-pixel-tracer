@@ -2,9 +2,10 @@ import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import BOTH, LEFT, RIGHT, NORMAL, DISABLED, HORIZONTAL, W, X, BOTTOM, Y
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageGrab
 import os
 import threading
+import time
 
 
 from config import (
@@ -15,8 +16,8 @@ from config import (
 from image_window import ImageWindow
 from win_utils import poll_global_keys
 from calibration_window import CalibrationWindow
-from image_utils import split_image_into_chunks, count_existing_chunks, extract_common_colors
 from color_assistant_window import ColorAssistantWindow
+import pyautogui
 
 class ControlWindow(ttk.Window):
     """
@@ -31,10 +32,11 @@ class ControlWindow(ttk.Window):
         self.original_image_path = original_image_path
         self.chunk_folder = None
         self.original_pil_image = None
-        self.image_window = None
+        self.image_window: ImageWindow | None = None
         self.is_calibrating = False
         self.hotkey_map = DEFAULT_HOTKEYS.copy()
         self.stop_polling = False
+        self.is_drawing = False
  
         self.create_widgets()
  
@@ -49,6 +51,7 @@ class ControlWindow(ttk.Window):
     def get_total_chunks(self):
         if not self.chunk_folder:
             return 0
+        from image_utils import count_existing_chunks
         return count_existing_chunks(self.chunk_folder) or (self.num_chunks_x * self.num_chunks_y)
 
     def create_widgets(self):
@@ -104,6 +107,26 @@ class ControlWindow(ttk.Window):
         self.clickthrough_toggle = ttk.Checkbutton(mode_frame, text="Click-Through", variable=self.clickthrough_var, command=self.on_toggle_clickthrough)
         self.clickthrough_toggle.pack(side=RIGHT, expand=True)
  
+        # --- Stop Button ---
+        self.stop_drawing_button = ttk.Button(
+            main_frame,
+            text="Stop Drawing",
+            command=self.stop_automated_drawing,
+        )
+        # Initially hidden, shown only during drawing
+        self.stop_drawing_button.pack(pady=5, fill=X)
+        self.stop_drawing_button.pack_forget()
+
+        # --- Progress Bar ---
+        self.progress_bar = ttk.Progressbar(
+            main_frame,
+            orient=HORIZONTAL,
+            length=100,
+            mode='determinate'
+        )
+        self.progress_bar.pack(pady=5, fill=X)
+        self.progress_bar.pack_forget()
+
         # --- Rebind Key ---
         rebind_frame = ttk.Frame(main_frame)
         rebind_frame.pack(fill=X, pady=5)
@@ -181,22 +204,145 @@ class ControlWindow(ttk.Window):
 
     def open_color_assistant(self):
         """
-        Opens the color assistant window to select a highlight color.
+        Opens the color assistant window, now passing the image path to it
+        so it can perform its own color extraction.
         """
         if not self.original_image_path:
+            messagebox.showerror("Error", "Please load an image before opening the Color Assistant.")
             return
 
         try:
-            colors = extract_common_colors(self.original_image_path, num_colors=5)
+            # Create the window, passing the image path instead of pre-fetched colors
+            assistant = ColorAssistantWindow(self, self.original_image_path)
+            self.wait_window(assistant) # Wait for the user to finish in the assistant window
             
-            assistant = ColorAssistantWindow(self, colors)
-            self.wait_window(assistant)
-            
-            if assistant.selected_color and self.image_window:
-                self.image_window.highlight_color(assistant.selected_color)
+            # After the window is closed, check its state and perform the action
+            if assistant.selected_colors and self.image_window:
+                # The first selected color is the "target" for drawing.
+                # All other selected colors will be treated as equivalent.
+                target_color = assistant.selected_colors[0]
+                
+                if assistant.automated_mode.get():
+                    self.start_automated_drawing(
+                        target_color,
+                        assistant.selected_colors, # Pass the whole list
+                        assistant.drawing_speed.get(),
+                        assistant.color_tolerance.get() # This is the "matching" tolerance
+                    )
+                else:
+                    # If not in automated mode, just highlight all selected colors
+                    self.image_window.highlight_colors(
+                        assistant.selected_colors,
+                        assistant.color_tolerance.get() # Use the same tolerance for highlighting
+                    )
 
         except Exception as e:
-            messagebox.showerror("Error", f"Could not extract colors: {e}")
+            # This is a fallback for errors during window creation
+            messagebox.showerror("Error", f"Could not open Color Assistant: {e}")
+
+    def start_automated_drawing(self, primary_color, all_colors, speed, tolerance):
+        if not self.image_window or not self.image_window.single_chunk_mode:
+            messagebox.showwarning("Mode Error", "Automated drawing requires Single Chunk Mode.")
+            return
+
+        if self.is_drawing:
+            messagebox.showwarning("Busy", "Already drawing.")
+            return
+
+        self.is_drawing = True
+        self.color_assistant_button.config(state=DISABLED)
+        self.image_window.highlight_colors(all_colors, tolerance)
+        self.stop_drawing_button.pack(pady=5, fill=X)
+        self.progress_bar.pack(pady=5, fill=X)
+        
+        # Enable click-through
+        self.clickthrough_var.set(True)
+        self.on_toggle_clickthrough()
+
+        # This should run in a separate thread to avoid freezing the GUI
+        threading.Thread(target=self._drawing_thread, args=(primary_color, all_colors, speed, tolerance), daemon=True).start()
+
+    def _drawing_thread(self, primary_color, all_colors, speed, tolerance):
+        
+        def _update_progress(value):
+            self.progress_bar['value'] = value
+            self.update_idletasks() # Use update_idletasks for smoother UI updates
+
+        def _finish_drawing():
+            self.is_drawing = False
+            self.color_assistant_button.config(state=NORMAL)
+            self.stop_drawing_button.pack_forget()
+            self.progress_bar.pack_forget()
+            
+            # Restore click-through state and clear highlight
+            self.clickthrough_var.set(False)
+            self.on_toggle_clickthrough()
+            if self.image_window:
+                self.image_window.clear_color_highlight()
+            print("Automated drawing finished.")
+
+        try:
+            # Add a brief pause to ensure the window is click-through before we start
+            time.sleep(0.5)
+            
+            if self.image_window is None:
+                print("No image window available for drawing.")
+                self.after(0, _finish_drawing)
+                return
+                
+            pixel_locations = self.image_window.get_pixel_locations_for_colors(all_colors)
+            
+            if not pixel_locations:
+                print("No pixels of the specified color found in the current chunk.")
+            else:
+                total_pixels = len(pixel_locations)
+                self.after(0, lambda: self.progress_bar.config(maximum=total_pixels))
+
+                original_pos = pyautogui.position()
+
+                for i, (screen_x, screen_y) in enumerate(pixel_locations):
+                    if not self.is_drawing:
+                        print("Drawing stopped by user.")
+                        break
+                    
+                    current_pixel_color = ImageGrab.grab(bbox=(screen_x, screen_y, screen_x + 1, screen_y + 1)).getpixel((0, 0))
+
+                    # Check if current pixel needs to be drawn
+                    if isinstance(current_pixel_color, tuple) and len(current_pixel_color) >= 3:
+                        is_blank_canvas = all(c > 230 for c in current_pixel_color[:3])
+                        is_white_canvas = all(c >= 250 for c in current_pixel_color[:3])
+                        
+                        safe_primary_color = tuple(int(c) for c in primary_color)
+                        target_is_light = all(c > 180 for c in safe_primary_color)
+                        
+                        if target_is_light:
+                            canvas_sum = sum(current_pixel_color[:3])
+                            target_sum = sum(safe_primary_color)
+                            color_difference = abs(canvas_sum - target_sum)
+                            should_draw = is_white_canvas or color_difference > 30
+                        else:
+                            from image_utils import colors_are_similar
+                            is_target_color = any(colors_are_similar(current_pixel_color, c, tolerance) for c in all_colors)
+                            should_draw = is_blank_canvas or not is_target_color
+                    else:
+                        should_draw = False
+                    
+                    if should_draw:
+                        pyautogui.click(screen_x, screen_y)
+                        time.sleep(speed)
+
+                    self.after(0, _update_progress, i + 1)
+
+                pyautogui.moveTo(original_pos)
+                
+        except Exception as e:
+            print(f"An error occurred during automated drawing: {e}")
+        finally:
+            self.after(0, _finish_drawing)
+
+    def stop_automated_drawing(self):
+        """Stops the drawing process."""
+        self.is_drawing = False
 
     def calibrate_single_chunk(self):
         """
@@ -274,6 +420,7 @@ class ControlWindow(ttk.Window):
         os.makedirs(self.chunk_folder, exist_ok=True)
 
         # --- Split image into chunks ---
+        from image_utils import split_image_into_chunks
         self.num_chunks_x, self.num_chunks_y, self.total_chunks = split_image_into_chunks(
             self.original_image_path, self.chunk_folder
         )

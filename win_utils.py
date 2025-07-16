@@ -29,10 +29,30 @@ def get_vk_code(key_str):
     """Converts a key string (like 'Insert', 'A') to a virtual key code."""
     if not key_str:
         return None
+
     key_str = key_str.upper()
+
+    # Mapping for special keys that VkKeyScan doesn't handle well
+    SPECIAL_KEYS = {
+        'INSERT': win32con.VK_INSERT,
+        'RIGHT': win32con.VK_RIGHT,
+        'LEFT': win32con.VK_LEFT,
+        'ADD': win32con.VK_ADD,
+        'SUBTRACT': win32con.VK_SUBTRACT,
+        'F12': win32con.VK_F12,
+    }
+
+    if key_str in SPECIAL_KEYS:
+        return SPECIAL_KEYS[key_str]
+        
     if hasattr(win32con, f'VK_{key_str}'):
         return getattr(win32con, f'VK_{key_str}')
-    return win32api.VkKeyScan(key_str.upper())
+        
+    # Fallback for alphanumeric keys
+    result = win32api.VkKeyScan(key_str)
+    if result == -1: # Key not found
+        return None
+    return result & 0xff # Return the low byte
 
 def poll_global_keys(app_instance):
     """
