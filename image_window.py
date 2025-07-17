@@ -4,7 +4,7 @@ import win32gui
 
 from config import (
     CHUNK_SIZE, DEFAULT_ALPHA, DEFAULT_SCALE, CALIBRATED_SCALE,
-    GRID_COLOR_FULL, GRID_COLOR_PIXEL, HIGHLIGHT_COLOR, TRANSPARENT_COLOR,
+    GRID_COLOR_FULL, GRID_COLOR_PIXEL, HIGHLIGHT_COLOR, TRANSPARENT_COLOR, SUCCESS_COLOR,
     DEFAULT_WINDOW_X, DEFAULT_WINDOW_Y, MIN_SCALE, MAX_SCALE, MIN_ALPHA, MAX_ALPHA
 )
 from win_utils import set_clickthrough
@@ -42,6 +42,7 @@ class ImageWindow(tk.Toplevel):
         self.highlighted_colors = []
         self.highlight_rects = []
         self.highlight_tolerance = 0
+        self.success_markers = []
 
         # Image dimensions
         self.original_width, self.original_height = self.original_pil_image.size
@@ -146,6 +147,7 @@ class ImageWindow(tk.Toplevel):
         self.draw_highlight()
         if self.highlighted_colors:
             self.draw_color_highlights()
+        self.draw_success_markers()
 
     def draw_single_chunk(self):
         """Draws the current chunk enlarged to fit the calibrated area."""
@@ -282,12 +284,49 @@ class ImageWindow(tk.Toplevel):
         self.update_display()
 
     def clear_color_highlight(self):
-        """Clears any color highlighting."""
+        """Clears any color highlighting and success markers."""
         for rect in self.highlight_rects:
             self.canvas.delete(rect)
         self.highlight_rects.clear()
         self.highlighted_colors = []
+        
+        self.clear_success_markers() # <-- Add this call
+        
         self.update_display()
+
+
+
+    def mark_pixel_as_successful(self, screen_x, screen_y):
+        """Draws a visual marker on a successfully drawn pixel."""
+        # Convert absolute screen coordinates to local canvas coordinates
+        canvas_x = screen_x - self.winfo_x()
+        canvas_y = screen_y - self.winfo_y()
+
+        # Draw a small, semi-transparent circle or rectangle as a marker
+        # We'll use a 3x3 rectangle for visibility
+        marker = self.canvas.create_rectangle(
+            canvas_x - 1, canvas_y - 1,
+            canvas_x + 1, canvas_y + 1,
+            outline=SUCCESS_COLOR,
+            fill=SUCCESS_COLOR,
+            width=1
+        )
+        self.success_markers.append(marker)
+    
+    def draw_success_markers(self):
+        """Redraws all success markers (needed if the display updates)."""
+        # This is a placeholder; a more robust implementation might re-calculate
+        # marker positions if the window moves during drawing, but for now,
+        # we assume it's static during the drawing process. The primary
+        # use is to ensure they are drawn on top.
+        for marker in self.success_markers:
+            self.canvas.tag_raise(marker)
+
+    def clear_success_markers(self):
+        """Clears all visual success markers from the canvas."""
+        for marker in self.success_markers:
+            self.canvas.delete(marker)
+        self.success_markers.clear()
 
     def get_pixel_locations_for_colors(self, target_colors):
         """

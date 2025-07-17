@@ -1,3 +1,4 @@
+import json
 import tkinter as tk
 from PIL import Image, ImageGrab, ImageTk
 import time
@@ -169,8 +170,19 @@ class CalibrationWindow(tk.Toplevel):
             
             if width > 0 and height > 0:
                 self.result = (x_min, y_min, width, height)
+                self._save_calibration_data()
             
             self.destroy()
+            
+    def _save_calibration_data(self):
+        """Saves calibration data to a JSON file."""
+        if self.result:
+            try:
+                with open('calibration.json', 'w') as f:
+                    json.dump({'calibration_rect': self.result}, f)
+                print("Calibration data saved successfully.")
+            except IOError as e:
+                print(f"Error saving calibration data: {e}")
             
     def _on_cancel(self, event):
         """Handles the escape key to cancel calibration."""

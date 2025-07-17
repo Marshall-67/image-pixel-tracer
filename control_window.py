@@ -4,6 +4,7 @@ from ttkbootstrap.constants import BOTH, LEFT, RIGHT, NORMAL, DISABLED, HORIZONT
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageGrab
 import os
+import json
 import threading
 import time
 
@@ -17,6 +18,7 @@ from image_window import ImageWindow
 from win_utils import poll_global_keys
 from calibration_window import CalibrationWindow
 from color_assistant_window import ColorAssistantWindow
+from image_utils import colors_are_similar
 import pyautogui
 
 class ControlWindow(ttk.Window):
@@ -37,8 +39,12 @@ class ControlWindow(ttk.Window):
         self.hotkey_map = DEFAULT_HOTKEYS.copy()
         self.stop_polling = False
         self.is_drawing = False
+        self.calibration_rect = None
+        self.settings = {} # Add a settings dictionary
  
+        self._load_settings() # Load settings on startup
         self.create_widgets()
+        self._load_calibration_data()
  
         if self.original_image_path:
             self.load_image(self.original_image_path)
@@ -160,6 +166,44 @@ class ControlWindow(ttk.Window):
         )
         self.info_label.config(text=info_text)
 
+    def _load_settings(self):
+        """Loads drawing settings from a JSON file."""
+        try:
+            with open('settings.json', 'r') as f:
+                self.settings = json.load(f)
+            print("Drawing settings loaded successfully.")
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("Settings file not found or invalid. Using defaults.")
+            # Define default settings here
+            self.settings = {
+                'drawing_speed': 0.05,
+                'color_tolerance': 10,
+                'double_click': False,
+                'automated_mode': False,
+                'grouping_sensitivity': 10.0
+            }
+
+    def _save_settings(self):
+        """Saves the current drawing settings to a JSON file."""
+        try:
+            with open('settings.json', 'w') as f:
+                json.dump(self.settings, f, indent=4)
+            print("Drawing settings saved successfully.")
+        except IOError as e:
+            print(f"Error saving settings: {e}")
+
+    def _load_calibration_data(self):
+        """Loads calibration data from the JSON file."""
+        try:
+            with open('calibration.json', 'r') as f:
+                data = json.load(f)
+                self.calibration_rect = tuple(data['calibration_rect'])
+                print("Calibration data loaded successfully.")
+        except FileNotFoundError:
+            print("Calibration file not found. Please calibrate.")
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"Error loading calibration data: {e}")
+
     def on_chunk_change(self, value):
         """Callback for when the chunk slider is moved."""
         if not self.image_window:
@@ -191,9 +235,11 @@ class ControlWindow(ttk.Window):
         enabled = self.single_chunk_var.get()
         self.image_window.toggle_single_chunk(enabled)
         self.scale_slider.config(state=DISABLED if enabled else NORMAL)
-        self.calibrate_button.config(state=NORMAL if enabled else DISABLED)
         if enabled:
+            self.calibrate_button.config(state=NORMAL if not self.calibration_rect else DISABLED)
             self.scale_slider.set(CALIBRATED_SCALE)
+        else:
+            self.calibrate_button.config(state=DISABLED)
 
     def on_toggle_clickthrough(self):
         """Callback for click-through mode toggle."""
@@ -212,35 +258,42 @@ class ControlWindow(ttk.Window):
             return
 
         try:
-            # Create the window, passing the image path instead of pre-fetched colors
-            assistant = ColorAssistantWindow(self, self.original_image_path)
-            self.wait_window(assistant) # Wait for the user to finish in the assistant window
+            # Pass the loaded settings to the assistant
+            assistant = ColorAssistantWindow(self, self.original_image_path, self.settings)
+            self.wait_window(assistant)
             
-            # After the window is closed, check its state and perform the action
-            if assistant.selected_colors and self.image_window:
-                # The first selected color is the "target" for drawing.
-                # All other selected colors will be treated as equivalent.
-                target_color = assistant.selected_colors[0]
+            # --- After the assistant closes, update our settings dictionary ---
+            if assistant.was_confirmed: # We'll add this flag to the assistant
+                self.settings['drawing_speed'] = assistant.drawing_speed.get()
+                self.settings['color_tolerance'] = assistant.color_tolerance.get()
+                self.settings['double_click'] = assistant.double_click.get()
+                self.settings['automated_mode'] = assistant.automated_mode.get()
+                self.settings['grouping_sensitivity'] = assistant.grouping_sensitivity.get()
+
+                if assistant.selected_colors and self.image_window:
+                    # The drawing logic remains here
+                    target_color = assistant.selected_colors[0]
                 
-                if assistant.automated_mode.get():
-                    self.start_automated_drawing(
-                        target_color,
-                        assistant.selected_colors, # Pass the whole list
-                        assistant.drawing_speed.get(),
-                        assistant.color_tolerance.get() # This is the "matching" tolerance
-                    )
-                else:
-                    # If not in automated mode, just highlight all selected colors
-                    self.image_window.highlight_colors(
-                        assistant.selected_colors,
-                        assistant.color_tolerance.get() # Use the same tolerance for highlighting
-                    )
+                    if assistant.automated_mode.get():
+                        self.start_automated_drawing(
+                            target_color,
+                            assistant.selected_colors,  # Pass the whole list
+                            assistant.drawing_speed.get(),
+                            assistant.color_tolerance.get(),  # This is the "matching" tolerance
+                            assistant.double_click.get()
+                        )
+                    else:
+                        # If not in automated mode, just highlight all selected colors
+                        self.image_window.highlight_colors(
+                            assistant.selected_colors,
+                            assistant.color_tolerance.get() # Use the same tolerance for highlighting
+                        )
 
         except Exception as e:
             # This is a fallback for errors during window creation
             messagebox.showerror("Error", f"Could not open Color Assistant: {e}")
 
-    def start_automated_drawing(self, primary_color, all_colors, speed, tolerance):
+    def start_automated_drawing(self, primary_color, all_colors, speed, tolerance, double_click):
         if not self.image_window or not self.image_window.single_chunk_mode:
             messagebox.showwarning("Mode Error", "Automated drawing requires Single Chunk Mode.")
             return
@@ -260,84 +313,131 @@ class ControlWindow(ttk.Window):
         self.on_toggle_clickthrough()
 
         # This should run in a separate thread to avoid freezing the GUI
-        threading.Thread(target=self._drawing_thread, args=(primary_color, all_colors, speed, tolerance), daemon=True).start()
+        threading.Thread(target=self._drawing_thread, args=(primary_color, all_colors, speed, tolerance, double_click), daemon=True).start()
 
-    def _drawing_thread(self, primary_color, all_colors, speed, tolerance):
+    def _drawing_thread(self, primary_color, all_colors, speed, tolerance, double_click):
         
-        def _update_progress(value):
-            self.progress_bar['value'] = value
-            self.update_idletasks() # Use update_idletasks for smoother UI updates
-
         def _finish_drawing():
-            self.is_drawing = False
-            self.color_assistant_button.config(state=NORMAL)
-            self.stop_drawing_button.pack_forget()
-            self.progress_bar.pack_forget()
-            
-            # Restore click-through state and clear highlight
-            self.clickthrough_var.set(False)
-            self.on_toggle_clickthrough()
+            """Called on the main thread to clean up the GUI after drawing."""
             if self.image_window:
                 self.image_window.clear_color_highlight()
+                self.image_window.clear_success_markers()
+            
+            if self.progress_bar.winfo_exists():
+                # Fill the progress bar to show completion, then hide
+                self.progress_bar['value'] = self.progress_bar['maximum']
+                self.update_idletasks()
+                time.sleep(0.2)
+                self.progress_bar.pack_forget()
+
+            self.is_drawing = False
+            if self.color_assistant_button.winfo_exists():
+                self.color_assistant_button.config(state=NORMAL)
+            if self.stop_drawing_button.winfo_exists():
+                self.stop_drawing_button.pack_forget()
+            
+            self.clickthrough_var.set(False)
+            self.on_toggle_clickthrough()
             print("Automated drawing finished.")
 
         try:
-            # Add a brief pause to ensure the window is click-through before we start
-            time.sleep(0.5)
-            
-            if self.image_window is None:
-                print("No image window available for drawing.")
+            pyautogui.PAUSE = 0
+            pyautogui.MINIMUM_DURATION = 0
+
+            if not self.image_window or not (self.image_window.target_x is not None and self.image_window.target_w is not None):
+                messagebox.showerror("Not Calibrated", "Please calibrate the drawing area first.")
                 self.after(0, _finish_drawing)
                 return
-                
-            pixel_locations = self.image_window.get_pixel_locations_for_colors(all_colors)
+
+            # --- 1. Get initial ORDERED list of pixels to draw ---
+            # DO NOT CONVERT TO A SET. Keep it as a list to preserve order.
+            pixels_to_try = self.image_window.get_pixel_locations_for_colors(all_colors)
+            if not pixels_to_try:
+                print("No pixels of the specified color found.")
+                self.after(0, _finish_drawing)
+                return
+
+            # --- 2. Setup for retries and progress tracking ---
+            retry_counts = {loc: 0 for loc in pixels_to_try}
+            MAX_RETRIES = 3
+            total_pixels = len(pixels_to_try)
+            completed_count = 0
             
-            if not pixel_locations:
-                print("No pixels of the specified color found in the current chunk.")
-            else:
-                total_pixels = len(pixel_locations)
-                self.after(0, lambda: self.progress_bar.config(maximum=total_pixels))
+            self.after(0, lambda: self.progress_bar.config(maximum=total_pixels, value=0))
+            
+            original_pos = pyautogui.position()
 
-                original_pos = pyautogui.position()
-
-                for i, (screen_x, screen_y) in enumerate(pixel_locations):
+            # --- 3. The new ORDERED drawing loop ---
+            while pixels_to_try and self.is_drawing:
+                failed_this_pass = []
+                
+                # Iterate through the current list of pixels to try this pass
+                for pixel_location in pixels_to_try:
                     if not self.is_drawing:
-                        print("Drawing stopped by user.")
-                        break
+                        break # Exit inner loop if user stopped
                     
-                    current_pixel_color = ImageGrab.grab(bbox=(screen_x, screen_y, screen_x + 1, screen_y + 1)).getpixel((0, 0))
+                    (screen_x, screen_y) = pixel_location
 
-                    # Check if current pixel needs to be drawn
-                    if isinstance(current_pixel_color, tuple) and len(current_pixel_color) >= 3:
-                        is_blank_canvas = all(c > 230 for c in current_pixel_color[:3])
-                        is_white_canvas = all(c >= 250 for c in current_pixel_color[:3])
-                        
-                        safe_primary_color = tuple(int(c) for c in primary_color)
-                        target_is_light = all(c > 180 for c in safe_primary_color)
-                        
-                        if target_is_light:
-                            canvas_sum = sum(current_pixel_color[:3])
-                            target_sum = sum(safe_primary_color)
-                            color_difference = abs(canvas_sum - target_sum)
-                            should_draw = is_white_canvas or color_difference > 30
-                        else:
-                            from image_utils import colors_are_similar
-                            is_target_color = any(colors_are_similar(current_pixel_color, c, tolerance) for c in all_colors)
-                            should_draw = is_blank_canvas or not is_target_color
-                    else:
-                        should_draw = False
+                    # A. --- MODIFIED DRAWING ACTION ---
+                    # Replace the simple click with a more robust, tiny drag.
                     
-                    if should_draw:
-                        pyautogui.click(screen_x, screen_y)
+                    # Move to the target pixel first.
+                    pyautogui.moveTo(screen_x, screen_y)
+                    
+                    if double_click:
+                        # Perform a standard click first (to select the tool/color)
+                        pyautogui.click()
+                        # Then perform the tiny drag to apply the color
+                        pyautogui.dragRel(0, 1, duration=0.05, button='left')
+                    else:
+                        # Just perform the tiny drag. This holds the left button,
+                        # moves 1 pixel down, and releases.
+                        pyautogui.dragRel(0, 1, duration=0.05, button='left')
+
+                    # The user-defined speed delay is still respected after the action
+                    if speed > 0:
                         time.sleep(speed)
 
-                    self.after(0, _update_progress, i + 1)
+                    # B. Verify the click
+                    try:
+                        pixel_img = ImageGrab.grab(bbox=(screen_x, screen_y, screen_x + 1, screen_y + 1))
+                        current_pixel_color = pixel_img.getpixel((0, 0))
+                        is_successfully_drawn = any(colors_are_similar(current_pixel_color, c, tolerance) for c in all_colors)
+                    except Exception as e:
+                        print(f"Could not verify pixel at ({screen_x}, {screen_y}): {e}")
+                        is_successfully_drawn = False # Treat verification error as a failure
 
-                pyautogui.moveTo(original_pos)
-                
+                    # C. Handle success or failure
+                    if is_successfully_drawn:
+                        # Success! Mark it and increment completion count.
+                        if self.image_window:
+                            self.image_window.mark_pixel_as_successful(screen_x, screen_y)
+                        completed_count += 1
+                    else:
+                        # Failure! Check retry count.
+                        retry_counts[pixel_location] += 1
+                        if retry_counts[pixel_location] < MAX_RETRIES:
+                            failed_this_pass.append(pixel_location) # Re-queue for the next pass
+                        else:
+                            # Gave up on this pixel, but it's "complete" for progress purposes
+                            print(f"Pixel at {pixel_location} failed to draw after {MAX_RETRIES} attempts. Skipping.")
+                            completed_count += 1
+                    
+                    # Update progress bar after every attempt
+                    self.after(0, lambda p=completed_count: self.progress_bar.config(value=p))
+
+                if not self.is_drawing:
+                    break # Exit outer loop if user stopped
+
+                # Prepare for the next pass with only the pixels that failed
+                pixels_to_try = failed_this_pass
+
+            pyautogui.moveTo(original_pos)
+
         except Exception as e:
             print(f"An error occurred during automated drawing: {e}")
         finally:
+            pyautogui.PAUSE = 0.1
             self.after(0, _finish_drawing)
 
     def stop_automated_drawing(self):
@@ -360,7 +460,8 @@ class ControlWindow(ttk.Window):
             
             # Apply calibration if result was obtained
             if selector.result and self.image_window:
-                x_min, y_min, width, height = selector.result
+                self.calibration_rect = selector.result
+                x_min, y_min, width, height = self.calibration_rect
                 self.image_window.set_calibration(x_min, y_min, width, height)
                 
         finally:
@@ -438,6 +539,9 @@ class ControlWindow(ttk.Window):
         if self.image_window:
             self.image_window.destroy()
         self.image_window = ImageWindow(self, self.original_pil_image, self.num_chunks_x, self.num_chunks_y)
+        if self.calibration_rect:
+            x_min, y_min, width, height = self.calibration_rect
+            self.image_window.set_calibration(x_min, y_min, width, height)
         
         self.chunk_slider.config(to=self.total_chunks - 1, state=NORMAL)
         self.chunk_slider.set(0)
@@ -533,6 +637,7 @@ class ControlWindow(ttk.Window):
         
     def on_close(self):
         """Handle the window closing event."""
+        self._save_settings() # Save settings before closing
         print("Closing application...")
         self.stop_polling = True
         self.key_poll_thread.join(timeout=1) # Wait for poll thread to finish

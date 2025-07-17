@@ -4,34 +4,36 @@ from tkinter import messagebox
 from typing import List, Tuple, Optional, TYPE_CHECKING
 from collections import defaultdict
 
-# Import the NEW function and remove the old one
+from collections import defaultdict
+
+# Import our new, improved function
+from image_utils import extract_color_groups
 from ttkbootstrap.scrolled import ScrolledFrame
 
 if TYPE_CHECKING:
     from control_window import ControlWindow
-
-# A predefined set of primary colors for grouping is no longer needed
 
 class ColorAssistantWindow(tk.Toplevel):
     """
     A window to display common colors, now with controls to find and filter them.
     Colors are grouped by their nearest primary color.
     """
-    def __init__(self, master: 'ControlWindow', image_path: str):
+    def __init__(self, master: 'ControlWindow', image_path: str, settings: dict):
         super().__init__(master)
         self.master: 'ControlWindow' = master
         self.image_path = image_path
+        self.was_confirmed = False # Flag to check if "Apply" was clicked
         self.selected_colors: List[Tuple[int, int, int]] = []
         self.colors: List[Tuple[int, int, int]] = []
         self.swatches = {}
         self.pane_to_container_map = {}
 
-        # --- User-configurable variables ---
-        self.automated_mode = tk.BooleanVar(value=False)
-        self.drawing_speed = tk.DoubleVar(value=0.1)
-        self.color_tolerance = tk.IntVar(value=10)
-        # We no longer need 'grouping_tolerance'. We control the number of groups directly.
-        self.num_colors_to_find = tk.IntVar(value=10) # Default to 10 groups
+        # --- Use passed-in settings with .get() for safety ---
+        self.automated_mode = tk.BooleanVar(value=settings.get('automated_mode', False))
+        self.drawing_speed = tk.DoubleVar(value=settings.get('drawing_speed', 0.05))
+        self.color_tolerance = tk.IntVar(value=settings.get('color_tolerance', 10))
+        self.grouping_sensitivity = tk.DoubleVar(value=settings.get('grouping_sensitivity', 10.0))
+        self.double_click = tk.BooleanVar(value=settings.get('double_click', False))
 
         self._setup_window()
         self._create_widgets()
@@ -54,15 +56,24 @@ class ColorAssistantWindow(tk.Toplevel):
         find_frame = ttk.Labelframe(main_frame, text="1. Find Color Groups", padding=10)
         find_frame.pack(pady=(0, 10), fill=tk.X)
         
-        num_colors_frame = ttk.Frame(find_frame)
-        num_colors_frame.pack(fill=tk.X, expand=True, pady=(0, 5))
-        ttk.Label(num_colors_frame, text="Number of Groups:").pack(side=tk.LEFT)
-        self.num_colors_label = ttk.Label(num_colors_frame, text=f"{self.num_colors_to_find.get()}", width=3)
-        self.num_colors_label.pack(side=tk.RIGHT, padx=(5,0))
+        # --- NEW WIDGETS for DBSCAN sensitivity ---
+        sensitivity_frame = ttk.Frame(find_frame)
+        sensitivity_frame.pack(fill=tk.X, expand=True, pady=(0, 5))
+        ttk.Label(sensitivity_frame, text="Grouping Detail:").pack(side=tk.LEFT, anchor='w')
+        
+        sensitivity_label = ttk.Label(sensitivity_frame, text=f"{self.grouping_sensitivity.get():.1f}", width=4)
+        sensitivity_label.pack(side=tk.RIGHT, padx=(5,0))
+        
+        # Note the reversed scale: sliding right lowers `eps`, which means MORE detail.
         ttk.Scale(
-            num_colors_frame, from_=2, to=30, variable=self.num_colors_to_find, orient=tk.HORIZONTAL,
-            command=lambda v: self.num_colors_label.config(text=f"{int(float(v))}")
+            sensitivity_frame, from_=20.0, to=2.0,
+            variable=self.grouping_sensitivity,
+            orient=tk.HORIZONTAL,
+            command=lambda v: sensitivity_label.config(text=f"{float(v):.1f}")
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        helper_label = ttk.Label(find_frame, text="← Less Groups  |  More Groups →", font=("Segoe UI", 7))
+        helper_label.pack(fill=tk.X, pady=(0, 5), padx=5)
 
         ttk.Button(
             find_frame, text="Refresh Colors", command=self._update_color_swatches, style="info.TButton"
@@ -85,15 +96,21 @@ class ColorAssistantWindow(tk.Toplevel):
         )
         self.automated_checkbox.pack(anchor=tk.W, pady=2)
         
+        # Double click checkbox
+        self.double_click_checkbox = ttk.Checkbutton(
+            drawing_frame, text="Double Click", variable=self.double_click
+        )
+        self.double_click_checkbox.pack(anchor=tk.W, pady=2)
+
         # Drawing speed slider
         speed_frame = ttk.Frame(drawing_frame)
         speed_frame.pack(fill=tk.X, pady=2)
         ttk.Label(speed_frame, text="Drawing Speed (seconds):").pack(side=tk.LEFT)
-        speed_label = ttk.Label(speed_frame, text=f"{self.drawing_speed.get():.1f}", width=5)
+        speed_label = ttk.Label(speed_frame, text=f"{self.drawing_speed.get():.2f}", width=5)
         speed_label.pack(side=tk.RIGHT)
         ttk.Scale(
-            speed_frame, from_=0.05, to=1.0, variable=self.drawing_speed, orient=tk.HORIZONTAL,
-            command=lambda v: speed_label.config(text=f"{float(v):.1f}")
+            speed_frame, from_=0.01, to=1.0, variable=self.drawing_speed, orient=tk.HORIZONTAL,
+            command=lambda v: speed_label.config(text=f"{float(v):.2f}")
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         # Color tolerance slider
@@ -119,17 +136,16 @@ class ColorAssistantWindow(tk.Toplevel):
         ).pack(pady=5, fill=tk.X)
             
     def _update_color_swatches(self):
-        """Finds and groups colors using K-means and updates the UI."""
+        """Finds and groups colors using DBSCAN and updates the UI."""
         for widget in self.color_frame.winfo_children():
             widget.destroy()
         self.swatches.clear()
         self.pane_to_container_map.clear()
 
         try:
-            # Call our new, improved function
-            num_groups = self.num_colors_to_find.get()
-            from image_utils import extract_and_group_colors_kmeans
-            grouped_colors = extract_and_group_colors_kmeans(self.image_path, num_colors=num_groups)
+            # Call our new, improved function with the sensitivity parameter
+            sensitivity = self.grouping_sensitivity.get()
+            grouped_colors = extract_color_groups(self.image_path, eps=sensitivity)
         except Exception as e:
             messagebox.showerror("Error", f"Could not extract colors: {e}")
             return
@@ -148,6 +164,12 @@ class ColorAssistantWindow(tk.Toplevel):
             btn_toggle = ttk.Button(header_frame, text=f"▼ {group_name} ({len(colors_in_group)})", style="Link.TButton")
             btn_toggle.pack(side=tk.LEFT)
             btn_toggle.config(command=lambda p=pane, b=btn_toggle: self._toggle_pane(p, b))
+
+            btn_select_all = ttk.Button(
+                header_frame, text="Select All", style="Outline.TButton",
+                command=lambda g=colors_in_group: self._toggle_group_selection(g)
+            )
+            btn_select_all.pack(side=tk.RIGHT)
 
             swatch_container = ttk.Frame(pane)
             swatch_container.pack(fill=tk.X, padx=10, pady=5)
@@ -187,6 +209,22 @@ class ColorAssistantWindow(tk.Toplevel):
             container.pack(fill=tk.X, padx=10, pady=5)
             button.config(text=button.cget('text').replace('►', '▼'))
 
+    def _toggle_group_selection(self, colors_in_group: List[Tuple[int, int, int]]):
+        """Selects or deselects all colors in a given group."""
+        # Check if any color in the group is already selected
+        is_any_selected = any(c in self.selected_colors for c in colors_in_group)
+
+        if is_any_selected:
+            # If any are selected, deselect the entire group
+            for color in colors_in_group:
+                if color in self.selected_colors:
+                    self._on_color_select(color) # This will toggle it off
+        else:
+            # If none are selected, select the entire group
+            for color in colors_in_group:
+                if color not in self.selected_colors:
+                    self._on_color_select(color) # This will toggle it on
+
     def _on_color_select(self, color: Tuple[int, int, int]):
         """Handles toggling color selection and provides visual feedback."""
         swatch = self.swatches.get(color)
@@ -204,8 +242,9 @@ class ColorAssistantWindow(tk.Toplevel):
 
     def _confirm_selection(self):
         """Confirms the selection and closes the window."""
-        if not self.selected_colors:
-            messagebox.showwarning("No Color Selected", "Please select one or more colors or close the window.")
+        if self.automated_mode.get() and not self.selected_colors:
+            messagebox.showwarning("No Color Selected", "Please select one or more colors for automated drawing.")
             return
         
-        self.destroy() 
+        self.was_confirmed = True # Set the flag
+        self.destroy()

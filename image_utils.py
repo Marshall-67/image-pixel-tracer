@@ -6,63 +6,105 @@ import os
 from PIL import Image
 from config import CHUNK_SIZE
 import numpy as np
-from sklearn.cluster import KMeans
+# Import DBSCAN and remove KMeans
+from sklearn.cluster import DBSCAN
 from skimage.color import rgb2lab, lab2rgb
 from collections import defaultdict
 
 
-def extract_and_group_colors_kmeans(image_path, num_colors=10):
+def extract_color_groups(image_path, eps: float = 10.0, min_samples_pct=0.05):
     """
-    Extracts and groups colors from an image using K-means clustering
-    in the CIELAB color space for perceptually accurate results.
+    Extracts and groups perceptually similar colors from an image using DBSCAN
+    clustering in the CIELAB color space.
+
+    This method is effective at finding distinct color families without
+    specifying the number of groups in advance.
 
     Args:
         image_path (str): Path to the source image.
-        num_colors (int): The target number of color groups to create.
+        eps (float): The maximum distance (in LAB space) between two samples
+                     for one to be considered as in the neighborhood of the other.
+                     Lower values result in more, tighter color groups.
+        min_samples_pct (float): The percentage of total pixels required to form a
+                                 dense region (a color group).
 
     Returns:
-        dict: A dictionary where keys are group names (e.g., "Group 1")
-              and values are lists of the original RGB colors belonging to that group.
+        dict: A dictionary where keys are group names (e.g., "Group 1 (RGB: 255,0,0)")
+              and values are lists of the original RGB colors in that group.
     """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
-    # Load image and convert to RGB
+    # Load image, resize for performance, and convert to RGB
     image = Image.open(image_path).convert('RGB')
-    image.thumbnail((150, 150)) # Resize for performance
+    image.thumbnail((150, 150))
 
-    # Get pixel data and convert to a list of colors
+    # Get pixel data as a NumPy array
     pixels = np.array(image)
     pixels = pixels.reshape(-1, 3)
 
-    # Convert RGB pixel data to LAB color space for clustering
-    # We normalize RGB values to be between 0 and 1 for the conversion
+    # Avoid clustering if the image is tiny or has few colors
+    if len(pixels) < 50:
+        unique_colors = list(set(map(tuple, pixels)))
+        return {"Group 1": unique_colors}
+
+    # Convert RGB pixel data to LAB color space for perceptually uniform clustering
+    # Normalize RGB values to be between 0 and 1 for the conversion
     lab_pixels = rgb2lab(pixels / 255.0)
 
-    # Perform K-means clustering
-    # n_init='auto' is recommended to avoid a FutureWarning
-    kmeans = KMeans(n_clusters=num_colors, n_init='auto', random_state=42)
-    kmeans.fit(lab_pixels)
+    # Calculate min_samples based on a percentage of the total pixels
+    # This makes the clustering more robust to different image sizes
+    min_samples = max(5, int(len(pixels) * (min_samples_pct / 100.0)))
 
-    # Group original RGB pixels based on the cluster labels
+    # Perform DBSCAN clustering. n_jobs=-1 uses all available CPU cores.
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean', n_jobs=-1).fit(lab_pixels)
+    
+    # Get the set of unique labels (each unique label is a cluster)
+    unique_labels = set(db.labels_)
+    
+    # --- Group original RGB pixels based on the cluster labels ---
     grouped_colors = defaultdict(list)
-    for i, label in enumerate(kmeans.labels_):
+    # The label -1 is for "noise" points that don't belong to any cluster
+    noise_colors = []
+
+    for i, label in enumerate(db.labels_):
         original_rgb_color = tuple(pixels[i])
-        grouped_colors[f"Group {label + 1}"].append(original_rgb_color)
+        if label == -1:
+            noise_colors.append(original_rgb_color)
+        else:
+            grouped_colors[label].append(original_rgb_color)
+    
+    # --- Process the found clusters ---
+    final_groups = {}
+    
+    # Sort clusters by size (number of pixels) to give them stable names
+    sorted_labels = sorted(grouped_colors.keys(), key=lambda k: len(grouped_colors[k]), reverse=True)
+    
+    group_counter = 1
+    for label in sorted_labels:
+        cluster_pixels = grouped_colors[label]
+        
+        # Calculate the average color of the group to create a representative name
+        # We average the LAB values and convert back to RGB for accuracy
+        lab_cluster_pixels = rgb2lab(np.array(cluster_pixels) / 255.0)
+        avg_lab_color = np.mean(lab_cluster_pixels, axis=0)
+        # Reshape for lab2rgb and convert back
+        avg_rgb_color_float = lab2rgb(avg_lab_color.reshape(1, 1, 3))
+        avg_rgb_color = (avg_rgb_color_float[0][0] * 255).astype(int)
+        r, g, b = avg_rgb_color
+        
+        # Create a descriptive group name and store the unique colors
+        group_name = f"Group {group_counter} (RGB: {r},{g},{b})"
+        unique_colors_in_group = sorted(list(set(cluster_pixels)), key=lambda c: sum(int(x) for x in c))
+        final_groups[group_name] = unique_colors_in_group
+        group_counter += 1
+        
+    # Add the "noise" pixels as their own group if they exist
+    if noise_colors:
+        unique_noise_colors = sorted(list(set(noise_colors)), key=lambda c: sum(int(x) for x in c))
+        final_groups["Other Colors"] = unique_noise_colors
 
-    # For display, we can also find the average color of each group
-    # The cluster centers are in LAB, so convert them back to RGB
-    center_rgb_lab = lab2rgb(kmeans.cluster_centers_.reshape(num_colors, 1, 3))
-    center_rgb = (center_rgb_lab * 255).astype(int)
-
-    # You could optionally return these average colors to name the groups
-    # For now, we'll just return the grouped original colors.
-
-    # Remove duplicates from each group list
-    for group in grouped_colors:
-        grouped_colors[group] = sorted(list(set(grouped_colors[group])), key=lambda c: sum(int(x) for x in c))
-
-    return grouped_colors
+    return final_groups
 
 def colors_are_similar(color1, color2, tolerance=0):
     """

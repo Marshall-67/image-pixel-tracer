@@ -1,0 +1,7 @@
+{
+    "drawing_speed": 0.01,
+    "color_tolerance": 10,
+    "double_click": true,
+    "automated_mode": true,
+    "grouping_sensitivity": 10.0
+}
